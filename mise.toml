@@ -1,0 +1,241 @@
+# vm-bootstrap — Orca headless server + oh-my-pi (omp) with SearXNG, managed by mise.
+#
+# Canonical copy (PUBLIC — never put secrets, private IPs, or hostnames here):
+#   https://gist.github.com/twick00/6a7c3afaf0f906121fb62ced13d0cb84
+# Mirror: https://github.com/PlaneshiftDev/vm-bootstrap
+#
+# Quick start (fresh Linux VM, mise installed & activated):
+#   mkdir -p ~/vm-bootstrap && cd ~/vm-bootstrap
+#   for f in mise.toml AGENTS.md CLAUDE.md; do curl -fsSLO "https://gist.githubusercontent.com/twick00/6a7c3afaf0f906121fb62ced13d0cb84/raw/$f"; done
+#   $EDITOR mise.local.toml        # host-specific values, see [env] below
+#   mise trust && mise install && mise run setup
+#
+# Agents: read AGENTS.md before editing. Generic improvements go back to the gist
+# via `mise run publish`; host-specific values go in mise.local.toml (git-ignored,
+# auto-loaded by mise, never published).
+
+[env]
+ORCA_PORT = "6768"
+BOOTSTRAP_GIST = "6a7c3afaf0f906121fb62ced13d0cb84"
+BOOTSTRAP_REPO = "PlaneshiftDev/vm-bootstrap"
+
+# ---- Required, set in mise.local.toml (NOT here) --------------------------------
+# SEARXNG_URL   Base URL of the operator's SearXNG instance, e.g. http://host:8888
+#               (no trailing slash). It is on the private network; ask the operator
+#               for the host if you don't have it. Verify: curl -fsS "$SEARXNG_URL/healthz"
+#
+# ---- Optional -------------------------------------------------------------------
+# INSTALL_TAILSCALE  "1" to install Tailscale if missing (needs sudo). Default: only use it
+#                    if already present; pairing falls back to LAN when it isn't Running.
+#
+# Example mise.local.toml:
+#   [env]
+#   SEARXNG_URL = "http://searxng.internal:8888"
+#   INSTALL_TAILSCALE = "1"
+
+[tools]
+# omp — pinned via mise registry (backed by github:can1357/oh-my-pi releases)
+oh-my-pi = "latest"
+# Orca — distro-neutral AppImage. Needs FUSE to run as-is; `orca-appimage` task
+# extracts it and exposes bin/orca-ide, so it works on FUSE-less containers too.
+"github:stablyai/orca" = { version = "latest", asset_pattern = "orca-linux*.AppImage", rename_exe = "orca-ide", bin_path = "bin" }
+
+# ================================================================================
+# Tasks — `mise tasks` to list, `mise run setup` for everything.
+# ================================================================================
+
+[tasks.check-env]
+description = "Fail early if required host-specific values are missing"
+quiet = true
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -z "${SEARXNG_URL:-}" ]; then
+  echo "SEARXNG_URL is not set. Create mise.local.toml next to mise.toml:" >&2
+  printf '  [env]\\n  SEARXNG_URL = "http://<searxng-host>:8888"\\n' >&2
+  echo "then: mise trust && mise run setup" >&2
+  exit 1
+fi
+curl -fsS --max-time 5 "$SEARXNG_URL/" >/dev/null || { echo "SEARXNG_URL ($SEARXNG_URL) not reachable" >&2; exit 1; }
+"""
+
+[tasks.tailscale]
+description = "Optional: use Tailscale if present (install only when INSTALL_TAILSCALE=1); never blocks"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+if ! command -v tailscale >/dev/null; then
+  if [ "${INSTALL_TAILSCALE:-0}" = 1 ]; then curl -fsSL https://tailscale.com/install.sh | sh
+  else echo "Tailscale not installed — LAN only. (Set INSTALL_TAILSCALE = \"1\" in mise.local.toml to install.)"; exit 0; fi
+fi
+state() { tailscale status --json 2>/dev/null | sed -n 's/.*"BackendState": *"\\([^"]*\\)".*/\\1/p' | head -1; }
+if [ "$(state)" != Running ]; then
+  # Never block on browser auth: give it a moment, then hand the URL to the operator.
+  sudo tailscale up --timeout 20s >/dev/null 2>&1 || true
+fi
+if [ "$(state)" != Running ]; then
+  url="$(tailscale status --json 2>/dev/null | sed -n 's/.*"AuthURL": *"\\([^"]*\\)".*/\\1/p' | head -1)"
+  echo "Tailscale state: $(state). Authenticate this node, then re-run: ${url:-run 'sudo tailscale up' for a login URL}" >&2
+  echo "Tip: for always-on servers, disable key expiry for this node in the Tailscale admin console." >&2
+  echo "Continuing with LAN only." >&2
+  exit 0
+fi
+echo "tailscale: $(tailscale ip -4) ($(tailscale status --json | sed -n 's/.*"DNSName": *"\\([^"]*\\)\\.".*/\\1/p' | head -1))"
+"""
+
+[tasks.orca-appimage]
+description = "Make the mise-installed Orca AppImage runnable without FUSE"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+dir="$(mise where github:stablyai/orca)"
+if [ ! -x "$dir/bin/orca-ide" ]; then
+  echo "extracting $dir/orca-ide.AppImage"
+  (cd "$dir" && ./orca-ide.AppImage --appimage-extract >/dev/null)
+  mkdir -p "$dir/bin"
+  ln -sfn ../squashfs-root/resources/bin/orca-ide "$dir/bin/orca-ide"
+fi
+"$dir/bin/orca-ide" --version
+"""
+
+[tasks.orca-service]
+description = "Run `orca-ide serve` as a persistent user service (systemd --user)"
+depends = ["tailscale", "orca-appimage"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+orca="$(mise where github:stablyai/orca)/bin/orca-ide"
+ts="$(tailscale status --json 2>/dev/null | grep -q '"BackendState": *"Running"' && tailscale ip -4 || true)"
+advert="${ts:-$(ip -4 route get 1.1.1.1 | awk '{print $7; exit}')}"
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/orca-serve.service <<EOF
+[Unit]
+Description=Orca headless runtime server
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+ExecStart=$orca serve --port $ORCA_PORT --pairing-address $advert --no-pairing
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now orca-serve.service
+loginctl enable-linger "$USER" 2>/dev/null || true
+systemctl --user is-active orca-serve.service
+"""
+
+[tasks.orca-pair]
+description = "Print all four pairing codes: {LAN,Tailscale} x {desktop,mobile}"
+depends = ["orca-service"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+orca="$(mise where github:stablyai/orca)/bin/orca-ide"
+lan="$(ip -4 route get 1.1.1.1 | awk '{print $7; exit}')"
+ts="$(tailscale status --json 2>/dev/null | grep -q '"BackendState": *"Running"' && tailscale ip -4 || true)"
+[ -n "$ts" ] || echo "Tailscale not Running — skipping Tailscale pairing codes (see 'mise run tailscale')." >&2
+log="$(mktemp)"; trap 'systemctl --user start orca-serve.service; rm -f "$log"' EXIT
+# Orca is single-instance per profile, so the service must be down while we generate codes.
+systemctl --user stop orca-serve.service
+for net in "LAN:$lan" "Tailscale:$ts"; do
+  name="${net%%:*}"; addr="${net#*:}"; [ -n "$addr" ] || continue
+  for mode in desktop mobile; do
+    flag=""; [ "$mode" = mobile ] && flag="--mobile-pairing"
+    : > "$log"
+    "$orca" serve --port "$ORCA_PORT" --pairing-address "$addr" $flag >"$log" 2>&1 &
+    pid=$!
+    for _ in $(seq 90); do grep -q 'Pairing URL' "$log" && break; sleep 1; done
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    echo "=== $name / $mode ($addr) ==="
+    grep -E 'Pairing URL|Web client URL' "$log" || { echo "no pairing URL after 90s:"; tail -5 "$log"; }
+  done
+done
+"""
+
+[tasks.omp-config]
+description = "Point omp web search exclusively at SearXNG (no LLM provider configured)"
+depends = ["check-env"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p ~/.omp/agent
+cat > ~/.omp/agent/config.yml <<EOF
+providers:
+  webSearchOrder: [searxng]
+
+searxng:
+  endpoint: $SEARXNG_URL
+EOF
+[ -f ~/.omp/agent/models.yml ] && echo "NOTE: ~/.omp/agent/models.yml exists — a model provider is configured; review it."
+omp --version
+omp search "mise task runner" --compact 2>&1 | head -3
+"""
+
+[tasks.agent-docs]
+description = "Let coding agents on this host know about AGENTS.md and the gist"
+quiet = true
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+stanza="## vm-bootstrap
+This host was set up from https://gist.github.com/twick00/$BOOTSTRAP_GIST — see {{config_root}}/AGENTS.md before changing installed tools, services, or omp config."
+for f in ~/.claude/CLAUDE.md ~/AGENTS.md; do
+  mkdir -p "$(dirname "$f")"
+  grep -q 'vm-bootstrap' "$f" 2>/dev/null || printf '\\n%s\\n' "$stanza" >> "$f"
+done
+"""
+
+[tasks.setup]
+description = "Full setup: tools, Orca service + pairing codes, omp/SearXNG, agent docs"
+depends = ["orca-pair", "omp-config", "agent-docs"]
+run = "echo 'setup complete — pairing codes above; omp has no LLM provider configured (by design).'"
+
+[tasks.pull]
+description = "Refresh mise.toml/AGENTS.md/CLAUDE.md from the gist (mise.local.toml untouched)"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+cd {{config_root}}
+for f in mise.toml AGENTS.md CLAUDE.md; do curl -fsSLo "$f" "https://gist.githubusercontent.com/twick00/$BOOTSTRAP_GIST/raw/$f"; done
+mise trust -q && echo "pulled; run: mise install && mise run setup"
+"""
+
+[tasks.scan-secrets]
+description = "Refuse to publish if any file contains private IPs, hostnames, tokens, or pairing codes"
+quiet = true
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+cd {{config_root}}
+pat='(10\\.[0-9]+\\.[0-9]+\\.[0-9]+|172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9]+\\.[0-9]+|192\\.168\\.[0-9]+\\.[0-9]+|100\\.([6-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]+\\.[0-9]+|\\.ts\\.net|orca://pair|eyJ[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[a-z]{2,}|/home/[a-z][a-z0-9_-]*/)'
+if grep -nE "$pat" mise.toml AGENTS.md CLAUDE.md README.md 2>/dev/null | grep -vE "scan-secrets|^[^:]+:[0-9]+:pat=|^[^:]+:[0-9]+:\\s*#"; then
+  echo "^^^ looks like a secret / private value. Move it to mise.local.toml or describe how to obtain it instead." >&2
+  exit 1
+fi
+echo "scan-secrets: clean"
+"""
+
+[tasks.publish]
+description = "Publish mise.toml/AGENTS.md/CLAUDE.md/README.md to the gist and the mirror repo (after scan-secrets)"
+depends = ["scan-secrets"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+cd {{config_root}}
+msg="${1:-Update vm-bootstrap}"
+files=(mise.toml AGENTS.md CLAUDE.md README.md)
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+# https + gh credential helper: works wherever `gh auth login` was done, no SSH keys needed.
+git clone -q "https://gist.github.com/$BOOTSTRAP_GIST.git" "$tmp/gist"
+git clone -q "https://github.com/$BOOTSTRAP_REPO.git" "$tmp/repo"
+for dst in "$tmp/gist" "$tmp/repo"; do
+  cp "${files[@]}" "$dst"/
+  git -C "$dst" add -A
+  if ! git -C "$dst" diff --cached --quiet; then git -C "$dst" commit -qm "$msg" && git -C "$dst" push -q; fi
+done
+echo "published: https://gist.github.com/twick00/$BOOTSTRAP_GIST and https://github.com/$BOOTSTRAP_REPO"
+"""
