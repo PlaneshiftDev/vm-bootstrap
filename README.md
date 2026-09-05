@@ -12,7 +12,9 @@ mise trust && mise install && mise run setup
 ```
 
 `mise run setup` installs the tools, runs `orca-ide serve` as a `systemd --user` service,
-prints four pairing codes (LAN/Tailscale × desktop/mobile), points omp at SearXNG, and
-leaves a note for coding agents. See `mise tasks` for the individual steps and `AGENTS.md`
+prints pairing codes (LAN, plus Tailscale when it's running; desktop and mobile each), points
+omp at SearXNG, and leaves a note for coding agents. Optional extras — DiscordChatExporter
+(`INSTALL_DCE`), Tailscale install (`INSTALL_TAILSCALE`) — are off until enabled in
+`mise.local.toml`; see the `[env]` comments in `mise.toml`. See `mise tasks` for the individual steps and `AGENTS.md`
 for how agents should evolve this file. No secrets or private addresses live here — see
 `mise.local.toml`.

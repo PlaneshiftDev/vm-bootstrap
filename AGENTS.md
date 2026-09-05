@@ -46,6 +46,15 @@ regex net, not a guarantee. Read the diff yourself and remove:
 Replace with a placeholder and a one-line note on how to get the real value. If the scan
 flags a false positive, restructure the text rather than weakening the pattern.
 
+## Optional components
+
+Anything not every VM needs is a task gated on `INSTALL_<NAME> = "1"` in `mise.local.toml`,
+**off by default**, and wired into `setup` so enabling it is a one-line change. Current:
+`INSTALL_DCE` (DiscordChatExporter), `INSTALL_TAILSCALE`. Follow the same shape when adding
+one: a no-op with a one-line hint when disabled, idempotent when enabled, secrets in the
+component's own file (e.g. `~/.config/dce/env`) with instructions on obtaining them — never
+in a mise file.
+
 ## Conventions
 
 - Keep `mise.toml` light and readable; tasks are bash with `set -euo pipefail`.

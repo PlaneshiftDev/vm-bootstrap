@@ -24,13 +24,20 @@ BOOTSTRAP_REPO = "PlaneshiftDev/vm-bootstrap"
 #               (no trailing slash). It is on the private network; ask the operator
 #               for the host if you don't have it. Verify: curl -fsS "$SEARXNG_URL/healthz"
 #
-# ---- Optional -------------------------------------------------------------------
+# ---- Optional (all off by default; enable in mise.local.toml) ---------------------
+# INSTALL_DCE        "1" to set up DiscordChatExporter (`dce` wrapper + agent skill) from
+#                    https://github.com/PlaneshiftDev/discord-chat-exporter (private repo:
+#                    `gh auth login` on the host first). The Discord token
+#                    goes ONLY in ~/.config/dce/env (created mode 600 by the installer, with
+#                    instructions on obtaining a token inside). Never in any mise file.
+# DCE_VERSION        pin the upstream DiscordChatExporter.Cli release (default: latest).
 # INSTALL_TAILSCALE  "1" to install Tailscale if missing (needs sudo). Default: only use it
 #                    if already present; pairing falls back to LAN when it isn't Running.
 #
 # Example mise.local.toml:
 #   [env]
 #   SEARXNG_URL = "http://searxng.internal:8888"
+#   INSTALL_DCE = "1"
 #   INSTALL_TAILSCALE = "1"
 
 [tools]
@@ -57,6 +64,29 @@ if [ -z "${SEARXNG_URL:-}" ]; then
   exit 1
 fi
 curl -fsS --max-time 5 "$SEARXNG_URL/" >/dev/null || { echo "SEARXNG_URL ($SEARXNG_URL) not reachable" >&2; exit 1; }
+"""
+
+[tasks.dce]
+description = "Optional (INSTALL_DCE=1): DiscordChatExporter CLI, `dce` wrapper, agent skill"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${INSTALL_DCE:-0}" != 1 ]; then echo "dce: disabled (set INSTALL_DCE = \\"1\\" in mise.local.toml to enable)"; exit 0; fi
+src="$HOME/.local/src/discord-chat-exporter"
+repo=PlaneshiftDev/discord-chat-exporter          # private: needs `gh auth login` (or a git credential) on this host
+if [ -d "$src/.git" ]; then git -C "$src" pull -q --ff-only
+else
+  mkdir -p "$(dirname "$src")"
+  if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then gh repo clone "$repo" "$src" -- -q
+  else GIT_TERMINAL_PROMPT=0 git clone -q "https://github.com/$repo.git" "$src" \
+    || { echo "dce: cannot clone $repo (private). Run 'gh auth login' as this user and re-run." >&2; exit 1; }
+  fi
+fi
+bash "$src/install.sh"                             # idempotent; honors DCE_VERSION / DCE_PLATFORM
+mkdir -p ~/.claude/skills && rm -rf ~/.claude/skills/discord-chat-exporter && cp -r "$src/skills/discord-chat-exporter" ~/.claude/skills/
+if grep -q 'DISCORD_TOKEN=PASTE' ~/.config/dce/env 2>/dev/null; then
+  echo "dce: no token yet — put DISCORD_TOKEN in ~/.config/dce/env (instructions inside), then verify with: dce guilds"
+fi
 """
 
 [tasks.tailscale]
@@ -190,8 +220,8 @@ done
 """
 
 [tasks.setup]
-description = "Full setup: tools, Orca service + pairing codes, omp/SearXNG, agent docs"
-depends = ["orca-pair", "omp-config", "agent-docs"]
+description = "Full setup: tools, optional extras, Orca service + pairing codes, omp/SearXNG, agent docs"
+depends = ["dce", "orca-pair", "omp-config", "agent-docs"]
 run = "echo 'setup complete — pairing codes above; omp has no LLM provider configured (by design).'"
 
 [tasks.pull]
