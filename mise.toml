@@ -181,7 +181,8 @@ Wants=network-online.target
 
 [Service]
 ExecStart=$orca serve --port $ORCA_PORT --pairing-address $advert --no-pairing
-Restart=on-failure
+# Why: a kernel OOM sweep of the app scope makes the serve wrapper exit 0, which on-failure never restarts.
+Restart=always
 RestartSec=5
 
 [Install]
