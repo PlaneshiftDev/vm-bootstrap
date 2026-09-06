@@ -245,6 +245,28 @@ for net in "LAN:$lan" "Tailscale:$ts"; do
 done
 """
 
+[tasks.omp-global]
+description = "Make omp resolvable from any directory (global mise config) and let mise see new omp releases at once"
+quiet = true
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+# The [tools] table in this file only applies inside this directory. Orca-launched agents and
+# interactive shells run omp from arbitrary repos, where the mise shim is inactive without a
+# global entry — which is how hosts end up with a second, hand-installed omp shadowing this one.
+mise use -g oh-my-pi@latest
+# `omp update` delegates to mise. Excluding oh-my-pi from mise's minimum_release_age gate keeps
+# that in step with GitHub's latest release instead of warning that the binary is stale and
+# suggesting the curl installer (which would recreate the duplicate). `mise settings add`
+# appends without deduplicating, so guard it.
+mise settings get minimum_release_age_excludes 2>/dev/null | grep -q '"oh-my-pi"' \
+  || mise settings add minimum_release_age_excludes oh-my-pi
+stray="$HOME/.local/bin/omp"
+if [ -e "$stray" ]; then
+  echo "NOTE: $stray shadows the mise-managed omp (~/.local/bin precedes the shims dir on PATH). Remove it: rm $stray"
+fi
+"""
+
 [tasks.omp-config]
 description = "Point omp web search exclusively at SearXNG (no LLM provider configured)"
 depends = ["check-env"]
@@ -305,8 +327,8 @@ done
 """
 
 [tasks.setup]
-description = "Full setup: tools, optional extras, Orca service + pairing codes, omp/SearXNG, agent docs"
-depends = ["dce", "orca-pair", "omp-config", "agent-docs"]
+description = "Full setup: tools, optional extras, Orca service + pairing codes, omp global + SearXNG, agent docs"
+depends = ["dce", "orca-pair", "omp-global", "omp-config", "agent-docs"]
 run = "echo 'setup complete — pairing codes above; omp has no LLM provider configured (by design).'"
 
 [tasks.pull]
