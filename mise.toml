@@ -120,20 +120,55 @@ run = """
 set -euo pipefail
 dir="$(mise where github:stablyai/orca)"
 if [ ! -x "$dir/bin/orca-ide" ]; then
-  echo "extracting $dir/orca-ide.AppImage"
-  (cd "$dir" && ./orca-ide.AppImage --appimage-extract >/dev/null)
+  # mise puts the asset at the install root or under bin/ depending on bin_path;
+  # don't assume. Extraction is required wherever /dev/fuse is absent (LXC, docker).
+  img="$(find "$dir" -maxdepth 2 -name 'orca-ide*.AppImage' -print -quit)"
+  [ -n "$img" ] || { echo "no orca-ide*.AppImage found under $dir" >&2; exit 1; }
+  echo "extracting $img"
+  (cd "$dir" && "$img" --appimage-extract >/dev/null)
   mkdir -p "$dir/bin"
   ln -sfn ../squashfs-root/resources/bin/orca-ide "$dir/bin/orca-ide"
 fi
 "$dir/bin/orca-ide" --version
 """
 
-[tasks.orca-service]
-description = "Run `orca-ide serve` as a persistent user service (systemd --user)"
-depends = ["tailscale", "orca-appimage"]
+[tasks.check-display]
+description = "Orca's Electron runtime needs an X server even for `serve`"
+quiet = true
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || command -v Xvfb >/dev/null 2>&1; then exit 0; fi
+cat >&2 <<'MSG'
+No display server, and Xvfb is not on PATH.
+Orca's runtime is an Electron app: `orca-ide serve` still needs an X server. It will
+start and supervise its own Xvfb when DISPLAY is unset, but only if Xvfb is installed.
+Without it the unit crash-loops with "Orca needs a usable display server".
+
+Install it, then re-run `mise run setup`:
+  Debian/Ubuntu:  sudo apt-get install -y xvfb
+  RPM-based:      sudo dnf install -y xorg-x11-server-Xvfb
+MSG
+exit 1
+"""
+
+[tasks.orca-service]
+description = "Run `orca-ide serve` as a persistent user service (systemd --user)"
+depends = ["tailscale", "orca-appimage", "check-display"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+# systemd --user needs a session bus. Non-login shells (mise tasks, ssh -T, LXC)
+# leave these unset, which makes `systemctl --user` fail with a confusing error.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR
+if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+if ! systemctl --user show-environment >/dev/null 2>&1; then
+  echo "no systemd --user manager for ${USER:-$(id -un)} (XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR)." >&2
+  echo "Enable a persistent one with: sudo loginctl enable-linger ${USER:-$(id -un)}" >&2
+  exit 1
+fi
 orca="$(mise where github:stablyai/orca)/bin/orca-ide"
 ts="$(tailscale status --json 2>/dev/null | grep -q '"BackendState": *"Running"' && tailscale ip -4 || true)"
 advert="${ts:-$(ip -4 route get 1.1.1.1 | awk '{print $7; exit}')}"
@@ -154,8 +189,19 @@ WantedBy=default.target
 EOF
 systemctl --user daemon-reload
 systemctl --user enable --now orca-serve.service
-loginctl enable-linger "$USER" 2>/dev/null || true
-systemctl --user is-active orca-serve.service
+loginctl enable-linger "${USER:-$(id -un)}" 2>/dev/null \
+  || echo "note: could not enable linger — the service will not survive reboot until you run: sudo loginctl enable-linger ${USER:-$(id -un)}" >&2
+# `is-active` prints "activating" while Restart= cycles a crash loop, so it alone
+# is a false green. NRestarts is definitive: a healthy first start never restarts.
+sleep 8
+state="$(systemctl --user is-active orca-serve.service || true)"
+restarts="$(systemctl --user show -p NRestarts --value orca-serve.service || echo 0)"
+if [ "$state" != active ] || [ "${restarts:-0}" -gt 0 ]; then
+  echo "orca-serve.service is not staying up (state=$state restarts=$restarts):" >&2
+  journalctl --user -u orca-serve.service -n 15 --no-pager >&2 || true
+  exit 1
+fi
+echo "orca-serve.service: active on port $ORCA_PORT (advertising $advert)"
 """
 
 [tasks.orca-pair]
@@ -164,6 +210,17 @@ depends = ["orca-service"]
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
+# systemd --user needs a session bus. Non-login shells (mise tasks, ssh -T, LXC)
+# leave these unset, which makes `systemctl --user` fail with a confusing error.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR
+if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+if ! systemctl --user show-environment >/dev/null 2>&1; then
+  echo "no systemd --user manager for ${USER:-$(id -un)} (XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR)." >&2
+  echo "Enable a persistent one with: sudo loginctl enable-linger ${USER:-$(id -un)}" >&2
+  exit 1
+fi
 orca="$(mise where github:stablyai/orca)/bin/orca-ide"
 lan="$(ip -4 route get 1.1.1.1 | awk '{print $7; exit}')"
 ts="$(tailscale status --json 2>/dev/null | grep -q '"BackendState": *"Running"' && tailscale ip -4 || true)"
@@ -179,7 +236,7 @@ for net in "LAN:$lan" "Tailscale:$ts"; do
     "$orca" serve --port "$ORCA_PORT" --pairing-address "$addr" $flag >"$log" 2>&1 &
     pid=$!
     for _ in $(seq 90); do grep -q 'Pairing URL' "$log" && break; sleep 1; done
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
     echo "=== $name / $mode ($addr) ==="
     grep -E 'Pairing URL|Web client URL' "$log" || { echo "no pairing URL after 90s:"; tail -5 "$log"; }
   done
@@ -193,16 +250,42 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 mkdir -p ~/.omp/agent
-cat > ~/.omp/agent/config.yml <<EOF
+cfg="$HOME/.omp/agent/config.yml"
+# This task owns exactly two keys: providers.webSearchOrder and searxng.endpoint.
+# An existing config.yml can hold operator settings (modelRoles, browser, todo,
+# task, ...) — merge into it instead of truncating it.
+if [ -s "$cfg" ]; then
+  cp -a "$cfg" "$cfg.bak"
+  python3 - "$cfg" "$SEARXNG_URL" <<'PY'
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit("refusing to overwrite an existing config.yml without PyYAML "
+             "(apt install python3-yaml, or pip install pyyaml)")
+path, url = sys.argv[1], sys.argv[2]
+cfg = yaml.safe_load(open(path)) or {}
+cfg.setdefault("providers", {})["webSearchOrder"] = ["searxng"]
+cfg.setdefault("searxng", {})["endpoint"] = url
+yaml.safe_dump(cfg, open(path, "w"), sort_keys=False, default_flow_style=False)
+print("merged searxng endpoint into " + path + " (backup: " + path + ".bak)")
+PY
+else
+  cat > "$cfg" <<EOF
 providers:
   webSearchOrder: [searxng]
 
 searxng:
   endpoint: $SEARXNG_URL
 EOF
-[ -f ~/.omp/agent/models.yml ] && echo "NOTE: ~/.omp/agent/models.yml exists — a model provider is configured; review it."
+fi
+# A bare `[ -f x ] && echo` aborts the whole task under `set -e` when x is absent.
+if [ -f "$HOME/.omp/agent/models.yml" ]; then
+  echo "NOTE: ~/.omp/agent/models.yml exists — a model provider is configured; review it."
+fi
 omp --version
-omp search "mise task runner" --compact 2>&1 | head -3
+# head closes the pipe early: without a guard, SIGPIPE + pipefail fails the task.
+omp search "mise task runner" --compact 2>&1 | head -3 || true
 """
 
 [tasks.agent-docs]
@@ -225,12 +308,12 @@ depends = ["dce", "orca-pair", "omp-config", "agent-docs"]
 run = "echo 'setup complete — pairing codes above; omp has no LLM provider configured (by design).'"
 
 [tasks.pull]
-description = "Refresh mise.toml/AGENTS.md/CLAUDE.md from the gist (mise.local.toml untouched)"
+description = "Refresh mise.toml/AGENTS.md/CLAUDE.md/README.md from the gist (mise.local.toml untouched)"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
 cd {{config_root}}
-for f in mise.toml AGENTS.md CLAUDE.md; do curl -fsSLo "$f" "https://gist.githubusercontent.com/twick00/$BOOTSTRAP_GIST/raw/$f"; done
+for f in mise.toml AGENTS.md CLAUDE.md README.md; do curl -fsSLo "$f" "https://gist.githubusercontent.com/twick00/$BOOTSTRAP_GIST/raw/$f"; done
 mise trust -q && echo "pulled; run: mise install && mise run setup"
 """
 
@@ -258,6 +341,9 @@ set -euo pipefail
 cd {{config_root}}
 msg="${1:-Update vm-bootstrap}"
 files=(mise.toml AGENTS.md CLAUDE.md README.md)
+# The quick start fetches three files; README.md only arrives via `mise run pull`. Fail
+# loudly instead of letting `cp` abort halfway through the publish set.
+for f in "${files[@]}"; do [ -f "$f" ] || { echo "publish: $f is missing here — run 'mise run pull' first" >&2; exit 1; }; done
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # https + gh credential helper: works wherever `gh auth login` was done, no SSH keys needed.
 git clone -q "https://gist.github.com/$BOOTSTRAP_GIST.git" "$tmp/gist"
