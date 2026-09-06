@@ -18,3 +18,8 @@ omp at SearXNG, and leaves a note for coding agents. Optional extras — Discord
 `mise.local.toml`; see the `[env]` comments in `mise.toml`. See `mise tasks` for the individual steps and `AGENTS.md`
 for how agents should evolve this file. No secrets or private addresses live here — see
 `mise.local.toml`.
+
+**Firewall:** clients must reach TCP `ORCA_PORT` (6768) on the VM. A hypervisor firewall with an
+inbound DROP policy (Proxmox, `firewall=1` on the NIC) silently drops it even though SSH works, and
+the Orca apps report "WebSocket closed". Allow the port there; `orca-service` prints the Proxmox
+one-liner.

@@ -202,6 +202,8 @@ if [ "$state" != active ] || [ "${restarts:-0}" -gt 0 ]; then
   exit 1
 fi
 echo "orca-serve.service: active on port $ORCA_PORT (advertising $advert)"
+# Nothing inside the guest can see a hypervisor firewall; say it every time so the symptom is recognisable.
+echo "note: clients must reach TCP $ORCA_PORT here. SSH working proves nothing about it: if pairing reports 'WebSocket closed', open the port on the hypervisor firewall (Proxmox with firewall=1 on the NIC: pvesh create /nodes/<node>/lxc/<ctid>/firewall/rules --type in --action ACCEPT --proto tcp --dport $ORCA_PORT --enable 1)."
 """
 
 [tasks.orca-pair]
